@@ -1,0 +1,265 @@
+blueprint:
+  name: IR Sauna – Programm Zone
+  description: >
+    Steuert zwei IR-Strahler (Liege+Oben) mit Programmen: Aus, Gleichmässig, Intervall (Gleichlauf Welle), Einmal Auf und Ab (Alias).
+    Dauer (min) und Max-Intensität (%) kommen aus Helpers. Transition 1s.
+  domain: automation
+  input:
+    select_program:
+      name: Programmauswahl (input_select)
+      selector:
+        entity:
+          domain: input_select
+    duration_minutes_entity:
+      name: Dauer in Minuten (input_number 5–30)
+      selector:
+        entity:
+          domain: input_number
+    # Max-Helligkeit des Programms
+    max_intensity_pct_entity:
+      name: Max-Intensität % (input_number, Default 100)
+      selector:
+        entity:
+          domain: input_number
+    # NEU: Zyklusdauer (nur für "Intervall", nicht für "Einmal AUF und AB")
+    cycle_minutes_entity:
+      name: Intervall – Zyklusdauer in Minuten (input_number)
+      selector:
+        entity:
+          domain: input_number
+    # Anzeige der Restlaufzeit im Dashboard
+    timer_entity:
+      name: Timer für Restlaufzeit (timer)
+      selector:
+        entity:
+          domain: timer
+    strahler_liege:
+      name: Strahler - Liege
+      selector:
+        entity:
+          domain: light
+    strahler_oben:
+      name: Strahler - Oben
+      selector:
+        entity:
+          domain: light
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  v_select: !input select_program
+  v_strahler_liege: !input strahler_liege
+  v_strahler_oben: !input strahler_oben
+  v_duration_entity: !input duration_minutes_entity
+  v_max_entity: !input max_intensity_pct_entity
+  v_cycle_entity: !input cycle_minutes_entity
+  v_timer: !input timer_entity
+
+  # Fixwerte wie gewünscht
+  min_pct: 5          # Min IR = 5%
+  step_pct: 5         # Schrittweite = 5%
+
+triggers:
+  - trigger: state
+    entity_id: !input select_program
+  # Timer-Ende fängt die Automation ab und schaltet AUS
+  - trigger: event
+    event_type: timer.finished
+    event_data:
+      entity_id: !input timer_entity
+  - trigger: event
+    event_type: timer.cancelled
+    event_data:
+      entity_id: !input timer_entity
+
+actions:
+  # NEU: Wenn durch timer.finished ausgelöst -> sofort AUS und beenden
+  - choose:
+      - conditions: >-
+          {{ trigger is defined
+            and trigger.platform == 'event'
+            and trigger.event.event_type in ['timer.finished','timer.cancelled'] }}
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id:
+                - !input strahler_liege
+                - !input strahler_oben
+            data:
+              transition: 1
+          - action: input_select.select_option
+            target:
+              entity_id: !input select_program
+            data:
+              option: 'AUS'
+          - stop: "Timer finished -> AUS"
+
+  # --- Laufzeit-Variablen berechnen ---
+  - variables:
+      program: "{{ states(v_select) }}"
+      duration: "{{ states(v_duration_entity) | int(20) }}"                # Gesamtprogrammdauer (min)
+      max_pct: "{{ states(v_max_entity) | int(100) }}"                     # aus Helper, Default 100
+      # Schritte rauf/runter (inkl. Endpunkte, ohne Doppelung am Gipfel)
+      up_steps: "{{ ((max_pct - min_pct) // step_pct) + 1 }}"
+      down_steps: "{{ ((max_pct - min_pct) // step_pct) + 1 }}"
+      steps_total: "{{ up_steps + down_steps }}"                            # z.B. 5..100 in 5er-Schritten
+      # Zyklusdauer für Intervall (Minuten aus Helper)
+      cycle_min: "{{ states(v_cycle_entity) | int(5) }}"
+      # Schrittzeit dynamisch berechnet:
+      #   - für "Intervall": Zykluszeit / Schrittanzahl
+      #   - für "Einmal AUF und AB": Gesamtdauer / Schrittanzahl
+      sec_intervall: "{{ ((cycle_min | int(5)) * 60 / (steps_total | int(1))) | round(0, 'ceil') | int }}"
+      sec_once: "{{ ((duration | int(20)) * 60 / (steps_total | int(1))) | round(0, 'ceil') | int }}"
+      end_ts: "{{ now().timestamp() + (duration | int(20)) * 60 }}"
+
+  # --- Timer steuern (für Restlaufzeit im Dashboard) ---
+  - choose:
+      - conditions: "{{ program == 'AUS' }}"
+        sequence:
+          - action: timer.cancel
+            target: { entity_id: !input timer_entity }
+    default:
+      - action: timer.start
+        target: { entity_id: !input timer_entity }
+        data:
+          duration: "{{ '%02d:%02d:%02d' | format(0, duration|int, 0) }}"
+
+  - choose:
+      # --- AUS ---------------------------------------------------------------
+      - conditions:
+          - condition: template
+            value_template: "{{ program == 'AUS' }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id:
+                - !input strahler_liege
+                - !input strahler_oben
+            data:
+              transition: 1
+
+      # --- GLEICHMÄSSIG ------------------------------------------------------
+      - conditions:
+          - condition: template
+            value_template: "{{ program == 'Gleichmässig' }}"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id:
+                - !input strahler_liege
+                - !input strahler_oben
+            data:
+              brightness_pct: "{{ max_pct }}"
+              transition: 1
+          - delay:
+              minutes: "{{ duration }}"
+          - action: light.turn_off
+            target:
+              entity_id:
+                - !input strahler_liege
+                - !input strahler_oben
+            data:
+              transition: 1
+          - action: timer.finish
+            target: { entity_id: !input timer_entity }
+          - action: input_select.select_option
+            target: { entity_id: !input select_program }
+            data: { option: 'AUS' }
+
+      # --- INTERVALL = WELLE (gleichlaufend; Schrittzeit aus Zyklusdauer) ---
+      - conditions:
+          - condition: template
+            value_template: "{{ program == 'Intervall' }}"
+        sequence:
+          - repeat:
+              while:
+                - condition: template
+                  value_template: "{{ is_state(v_select,'Intervall') and now().timestamp() < end_ts }}"
+              sequence:
+                # Aufwärts min..max
+                - repeat:
+                    for_each: "{{ range((min_pct|int), (max_pct|int) + 1, (step_pct|int)) | list }}"
+                    sequence:
+                      - variables: { b: "{{ repeat.item }}" }
+                      - action: light.turn_on
+                        target:
+                          entity_id:
+                            - !input strahler_liege
+                            - !input strahler_oben
+                        data:
+                          brightness_pct: "{{ b }}"
+                          transition: 1
+                      - delay: { seconds: "{{ sec_intervall }}" }
+                # Abwärts max..min
+                - repeat:
+                    for_each: "{{ range((max_pct|int) - (step_pct|int), (min_pct|int) - 1, -(step_pct|int)) | list }}"
+                    sequence:
+                      - variables: { b: "{{ repeat.item }}" }
+                      - action: light.turn_on
+                        target:
+                          entity_id:
+                            - !input strahler_liege
+                            - !input strahler_oben
+                        data:
+                          brightness_pct: "{{ b }}"
+                          transition: 1
+                      - delay: { seconds: "{{ sec_intervall }}" }
+          - action: light.turn_off
+            target:
+              entity_id:
+                - !input strahler_liege
+                - !input strahler_oben
+            data:
+              transition: 1
+          - action: timer.finish
+            target: { entity_id: !input timer_entity }
+          - action: input_select.select_option
+            target: { entity_id: !input select_program }
+            data: { option: 'AUS' }
+
+      # --- Einmal AUF und AB (ein Zyklus in gesamter Dauer) ------------------
+      - conditions:
+          - condition: template
+            value_template: "{{ program == 'Einmal AUF und AB' }}"
+        sequence:
+          # Aufwärts min..max
+          - repeat:
+              for_each: "{{ range((min_pct|int), (max_pct|int) + 1, (step_pct|int)) | list }}"
+              sequence:
+                - variables: { b: "{{ repeat.item }}" }
+                - action: light.turn_on
+                  target:
+                    entity_id:
+                      - !input strahler_liege
+                      - !input strahler_oben
+                  data:
+                    brightness_pct: "{{ b }}"
+                    transition: 1
+                - delay: { seconds: "{{ sec_once }}" }
+          # Abwärts max..min
+          - repeat:
+              for_each: "{{ range((max_pct|int) - (step_pct|int), (min_pct|int) - 1, -(step_pct|int)) | list }}"
+              sequence:
+                - variables: { b: "{{ repeat.item }}" }
+                - action: light.turn_on
+                  target:
+                    entity_id:
+                      - !input strahler_liege
+                      - !input strahler_oben
+                  data:
+                    brightness_pct: "{{ b }}"
+                    transition: 1
+                - delay: { seconds: "{{ sec_once }}" }
+          - action: light.turn_off
+            target:
+              entity_id:
+                - !input strahler_liege
+                - !input strahler_oben
+            data:
+              transition: 1
+          - action: timer.finish
+            target: { entity_id: !input timer_entity }
+          - action: input_select.select_option
+            target: { entity_id: !input select_program }
+            data: { option: 'AUS' }
