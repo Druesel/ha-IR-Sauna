@@ -2,7 +2,7 @@ blueprint:
   name: IR Sauna – Programm Zone
   description: >
     Steuert zwei IR-Strahler (Liege+Oben) mit Programmen: Aus, Gleichmässig, Intervall (Gleichlauf Welle), Einmal Auf und Ab (Alias).
-    Dauer (min) und Max-Intensität (%) kommen aus Helpers. Transition 1s.
+    Dauer (min) sowie Min-/Max-Intensität (%) kommen aus Helpers. Transition 1s.
   domain: automation
   input:
     select_program:
@@ -18,6 +18,12 @@ blueprint:
     # Max-Helligkeit des Programms
     max_intensity_pct_entity:
       name: Max-Intensität % (input_number, Default 100)
+      selector:
+        entity:
+          domain: input_number
+    # Min-Helligkeit des Programms
+    min_intensity_pct_entity:
+      name: Min-Intensität % (input_number, Default 5)
       selector:
         entity:
           domain: input_number
@@ -53,11 +59,11 @@ variables:
   v_strahler_oben: !input strahler_oben
   v_duration_entity: !input duration_minutes_entity
   v_max_entity: !input max_intensity_pct_entity
+  v_min_entity: !input min_intensity_pct_entity
   v_cycle_entity: !input cycle_minutes_entity
   v_timer: !input timer_entity
 
   # Fixwerte wie gewünscht
-  min_pct: 5          # Min IR = 5%
   step_pct: 5         # Schrittweite = 5%
 
 triggers:
@@ -81,6 +87,7 @@ actions:
             and trigger.platform == 'event'
             and trigger.event.event_type in ['timer.finished','timer.cancelled'] }}
         sequence:
+          # Schaltet beide Strahler aus
           - action: light.turn_off
             target:
               entity_id:
@@ -88,38 +95,30 @@ actions:
                 - !input strahler_oben
             data:
               transition: 1
+          # Setzt die Programmauswahl zurück auf AUS
           - action: input_select.select_option
             target:
               entity_id: !input select_program
             data:
               option: 'AUS'
+          # Beendet die Automation
           - stop: "Timer finished -> AUS"
 
   # --- Laufzeit-Variablen berechnen ---
   - variables:
       program: "{{ states(v_select) }}"
       duration: "{{ states(v_duration_entity) | int(20) }}"                # Gesamtprogrammdauer (min)
-      max_pct: "{{ states(v_max_entity) | int(100) }}"                     # aus Helper, Default 100
-      # Schritte rauf/runter (inkl. Endpunkte, ohne Doppelung am Gipfel)
-      up_steps: "{{ ((max_pct - min_pct) // step_pct) + 1 }}"
-      down_steps: "{{ ((max_pct - min_pct) // step_pct) + 1 }}"
-      steps_total: "{{ up_steps + down_steps }}"                            # z.B. 5..100 in 5er-Schritten
-      # Zyklusdauer für Intervall (Minuten aus Helper)
-      cycle_min: "{{ states(v_cycle_entity) | int(5) }}"
-      # Schrittzeit dynamisch berechnet:
-      #   - für "Intervall": Zykluszeit / Schrittanzahl
-      #   - für "Einmal AUF und AB": Gesamtdauer / Schrittanzahl
-      sec_intervall: "{{ ((cycle_min | int(5)) * 60 / (steps_total | int(1))) | round(0, 'ceil') | int }}"
-      sec_once: "{{ ((duration | int(20)) * 60 / (steps_total | int(1))) | round(0, 'ceil') | int }}"
       end_ts: "{{ now().timestamp() + (duration | int(20)) * 60 }}"
 
   # --- Timer steuern (für Restlaufzeit im Dashboard) ---
   - choose:
       - conditions: "{{ program == 'AUS' }}"
         sequence:
+          # Timer stoppen, wenn kein Programm läuft
           - action: timer.cancel
             target: { entity_id: !input timer_entity }
     default:
+      # Timer mit neuer Programmdauer starten
       - action: timer.start
         target: { entity_id: !input timer_entity }
         data:
@@ -131,6 +130,7 @@ actions:
           - condition: template
             value_template: "{{ program == 'AUS' }}"
         sequence:
+          # Sicherheitshalber beide Strahler ausschalten
           - action: light.turn_off
             target:
               entity_id:
@@ -144,16 +144,19 @@ actions:
           - condition: template
             value_template: "{{ program == 'Gleichmässig' }}"
         sequence:
+          # Strahler mit maximaler Intensität einschalten
           - action: light.turn_on
             target:
               entity_id:
                 - !input strahler_liege
                 - !input strahler_oben
             data:
-              brightness_pct: "{{ max_pct }}"
+              brightness_pct: "{{ states(v_max_entity) | int(100) }}"
               transition: 1
+          # Gewählte Dauer warten
           - delay:
               minutes: "{{ duration }}"
+          # Strahler ausschalten
           - action: light.turn_off
             target:
               entity_id:
@@ -161,8 +164,10 @@ actions:
                 - !input strahler_oben
             data:
               transition: 1
+          # Timer manuell beenden
           - action: timer.finish
             target: { entity_id: !input timer_entity }
+          # Programmauswahl zurücksetzen
           - action: input_select.select_option
             target: { entity_id: !input select_program }
             data: { option: 'AUS' }
@@ -172,39 +177,58 @@ actions:
           - condition: template
             value_template: "{{ program == 'Intervall' }}"
         sequence:
+          # Starthelligkeit und Richtung definieren
+          - variables:
+              b: "{{ states(v_min_entity) | int(5) }}"
+              direction: 'up'
+          # Solange Programm aktiv und Zeit nicht abgelaufen
           - repeat:
               while:
-                - condition: template
-                  value_template: "{{ is_state(v_select,'Intervall') and now().timestamp() < end_ts }}"
+                - condition: template >-
+                    {{ is_state(v_select,'Intervall') and now().timestamp() < end_ts }}
               sequence:
-                # Aufwärts min..max
-                - repeat:
-                    for_each: "{{ range((min_pct|int), (max_pct|int) + 1, (step_pct|int)) | list }}"
-                    sequence:
-                      - variables: { b: "{{ repeat.item }}" }
-                      - action: light.turn_on
-                        target:
-                          entity_id:
-                            - !input strahler_liege
-                            - !input strahler_oben
-                        data:
-                          brightness_pct: "{{ b }}"
-                          transition: 1
-                      - delay: { seconds: "{{ sec_intervall }}" }
-                # Abwärts max..min
-                - repeat:
-                    for_each: "{{ range((max_pct|int) - (step_pct|int), (min_pct|int) - 1, -(step_pct|int)) | list }}"
-                    sequence:
-                      - variables: { b: "{{ repeat.item }}" }
-                      - action: light.turn_on
-                        target:
-                          entity_id:
-                            - !input strahler_liege
-                            - !input strahler_oben
-                        data:
-                          brightness_pct: "{{ b }}"
-                          transition: 1
-                      - delay: { seconds: "{{ sec_intervall }}" }
+                # Laufende Werte und Schrittzeit berechnen
+                - variables:
+                    min_pct: "{{ states(v_min_entity) | int(5) }}"
+                    max_pct: "{{ states(v_max_entity) | int(100) }}"
+                    cycle_min: "{{ states(v_cycle_entity) | int(5) }}"
+                    steps_total: "{{ ((max_pct - min_pct) // step_pct + 1) * 2 }}"
+                    sec_intervall: "{{ ((cycle_min * 60 / steps_total) | round(0, 'ceil') | int) }}"
+                    b: "{{ [[b, max_pct] | min, min_pct] | max }}"
+                # Strahler mit aktueller Helligkeit einschalten
+                - action: light.turn_on
+                  target:
+                    entity_id:
+                      - !input strahler_liege
+                      - !input strahler_oben
+                  data:
+                    brightness_pct: "{{ b }}"
+                    transition: 1
+                # Schrittzeit abwarten
+                - delay: { seconds: "{{ sec_intervall }}" }
+                # Helligkeit je nach Richtung anpassen
+                - choose:
+                    - conditions: "{{ direction == 'up' }}"
+                      sequence:
+                        # Helligkeit erhöhen
+                        - variables:
+                            b: "{{ [b + step_pct, max_pct] | min }}"
+                        - choose:
+                            - conditions: "{{ b >= max_pct }}"
+                              sequence:
+                                # Oberes Limit erreicht -> Richtung wechseln
+                                - variables: { direction: 'down' }
+                    - conditions: "{{ direction == 'down' }}"
+                      sequence:
+                        # Helligkeit verringern
+                        - variables:
+                            b: "{{ [b - step_pct, min_pct] | max }}"
+                        - choose:
+                            - conditions: "{{ b <= min_pct }}"
+                              sequence:
+                                # Unteres Limit erreicht -> Richtung wechseln
+                                - variables: { direction: 'up' }
+          # Programmende: Strahler ausschalten
           - action: light.turn_off
             target:
               entity_id:
@@ -212,8 +236,10 @@ actions:
                 - !input strahler_oben
             data:
               transition: 1
+          # Timer beenden
           - action: timer.finish
             target: { entity_id: !input timer_entity }
+          # Programmauswahl zurücksetzen
           - action: input_select.select_option
             target: { entity_id: !input select_program }
             data: { option: 'AUS' }
@@ -223,11 +249,26 @@ actions:
           - condition: template
             value_template: "{{ program == 'Einmal AUF und AB' }}"
         sequence:
-          # Aufwärts min..max
+          # Starthelligkeit und Richtung setzen
+          - variables:
+              b: "{{ states(v_min_entity) | int(5) }}"
+              direction: 'up'
+          # Ein Durchlauf von min zu max und zurück
           - repeat:
-              for_each: "{{ range((min_pct|int), (max_pct|int) + 1, (step_pct|int)) | list }}"
+              while:
+                - condition: template >-
+                    {{ is_state(v_select,'Einmal AUF und AB')
+                       and now().timestamp() < end_ts
+                       and repeat.index <= ((states(v_max_entity)|int(100) - states(v_min_entity)|int(5)) // step_pct + 1) * 2 }}
               sequence:
-                - variables: { b: "{{ repeat.item }}" }
+                # Laufende Werte und Schrittzeit berechnen
+                - variables:
+                    min_pct: "{{ states(v_min_entity) | int(5) }}"
+                    max_pct: "{{ states(v_max_entity) | int(100) }}"
+                    steps_total: "{{ ((max_pct - min_pct) // step_pct + 1) * 2 }}"
+                    sec_once: "{{ ((duration * 60 / steps_total) | round(0, 'ceil') | int) }}"
+                    b: "{{ [[b, max_pct] | min, min_pct] | max }}"
+                # Strahler auf aktuelle Helligkeit setzen
                 - action: light.turn_on
                   target:
                     entity_id:
@@ -236,21 +277,31 @@ actions:
                   data:
                     brightness_pct: "{{ b }}"
                     transition: 1
+                # Schrittzeit abwarten
                 - delay: { seconds: "{{ sec_once }}" }
-          # Abwärts max..min
-          - repeat:
-              for_each: "{{ range((max_pct|int) - (step_pct|int), (min_pct|int) - 1, -(step_pct|int)) | list }}"
-              sequence:
-                - variables: { b: "{{ repeat.item }}" }
-                - action: light.turn_on
-                  target:
-                    entity_id:
-                      - !input strahler_liege
-                      - !input strahler_oben
-                  data:
-                    brightness_pct: "{{ b }}"
-                    transition: 1
-                - delay: { seconds: "{{ sec_once }}" }
+                # Helligkeit je nach Richtung anpassen
+                - choose:
+                    - conditions: "{{ direction == 'up' }}"
+                      sequence:
+                        # Helligkeit erhöhen
+                        - variables:
+                            b: "{{ [b + step_pct, max_pct] | min }}"
+                        - choose:
+                            - conditions: "{{ b >= max_pct }}"
+                              sequence:
+                                # Obere Grenze erreicht -> Richtung wechseln
+                                - variables: { direction: 'down' }
+                    - conditions: "{{ direction == 'down' }}"
+                      sequence:
+                        # Helligkeit verringern
+                        - variables:
+                            b: "{{ [b - step_pct, min_pct] | max }}"
+                        - choose:
+                            - conditions: "{{ b <= min_pct }}"
+                              sequence:
+                                # Untere Grenze erreicht -> Richtung wechseln
+                                - variables: { direction: 'up' }
+          # Programmende: Strahler ausschalten
           - action: light.turn_off
             target:
               entity_id:
@@ -258,8 +309,10 @@ actions:
                 - !input strahler_oben
             data:
               transition: 1
+          # Timer beenden
           - action: timer.finish
             target: { entity_id: !input timer_entity }
+          # Programmauswahl zurücksetzen
           - action: input_select.select_option
             target: { entity_id: !input select_program }
             data: { option: 'AUS' }
