@@ -141,7 +141,18 @@ actions:
           - condition: template
             value_template: "{{ program == 'Gleichmässig' }}"
         sequence:
-          # Strahler mit maximaler Intensität einschalten
+          # Strahler einschalten (setzen initial selbst auf 50%)
+          - action: light.turn_on
+            target:
+              entity_id:
+                - !input strahler_liege
+                - !input strahler_oben
+            data:
+              transition: 1
+          # Kurz warten, bevor die Zielintensität gesetzt wird
+          - delay:
+              seconds: 2
+          # Strahler auf maximale Intensität setzen
           - action: light.turn_on
             target:
               entity_id:
