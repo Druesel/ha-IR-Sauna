@@ -182,7 +182,8 @@ actions:
           # Solange Programm aktiv und Zeit nicht abgelaufen
           - repeat:
               while:
-                - condition: template >-
+                - condition: template
+                  value_template: >-
                     {{ is_state(v_select,'Intervall') and now().timestamp() < end_ts }}
               sequence:
                 # Laufende Werte und Schrittzeit berechnen
@@ -254,7 +255,8 @@ actions:
           # Ein Durchlauf von min zu max und zurück
           - repeat:
               while:
-                - condition: template >-
+                - condition: template
+                  value_template: >-
                     {{ is_state(v_select,'Einmal AUF und AB')
                        and now().timestamp() < end_ts
                        and repeat.index <= ((states(v_max_entity)|int(100) - states(v_min_entity)|int(5)) // step_pct + 1) * 2 }}
