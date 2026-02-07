@@ -70,22 +70,20 @@ triggers:
   - trigger: state
     entity_id: !input select_program
   # Timer-Ende fängt die Automation ab und schaltet AUS
-  - trigger: event
-    event_type: timer.finished
-    event_data:
-      entity_id: !input timer_entity
-  - trigger: event
-    event_type: timer.cancelled
-    event_data:
-      entity_id: !input timer_entity
+  - trigger: state
+    entity_id: !input timer_entity
+    from: active
+    to: idle
 
 actions:
-  # NEU: Wenn durch timer.finished ausgelöst -> sofort AUS und beenden
+  # Wenn der Timer auf idle wechselt -> sofort AUS und beenden
   - choose:
       - conditions: >-
           {{ trigger is defined
-            and trigger.platform == 'event'
-            and trigger.event.event_type in ['timer.finished','timer.cancelled'] }}
+            and trigger.platform == 'state'
+            and trigger.entity_id == v_timer
+            and trigger.to_state is defined
+            and trigger.to_state.state == 'idle' }}
         sequence:
           # Schaltet beide Strahler aus
           - action: light.turn_off
@@ -102,7 +100,7 @@ actions:
             data:
               option: 'AUS'
           # Beendet die Automation
-          - stop: "Timer finished -> AUS"
+          - stop: "Timer idle -> AUS"
 
   # --- Laufzeit-Variablen berechnen ---
   - variables:
