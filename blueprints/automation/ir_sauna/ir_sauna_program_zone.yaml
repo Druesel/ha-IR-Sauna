@@ -151,7 +151,7 @@ actions:
               transition: 1
           # Kurz warten, bevor die Zielintensität gesetzt wird
           - delay:
-              seconds: 2
+              seconds: 1
           # Strahler auf maximale Intensität setzen
           - action: light.turn_on
             target:
