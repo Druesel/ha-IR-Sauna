@@ -70,22 +70,20 @@ triggers:
   - trigger: state
     entity_id: !input select_program
   # Timer-Ende fängt die Automation ab und schaltet AUS
-  - trigger: event
-    event_type: timer.finished
-    event_data:
-      entity_id: !input timer_entity
-  - trigger: event
-    event_type: timer.cancelled
-    event_data:
-      entity_id: !input timer_entity
+  - trigger: state
+    entity_id: !input timer_entity
+    from: active
+    to: idle
 
 actions:
-  # NEU: Wenn durch timer.finished ausgelöst -> sofort AUS und beenden
+  # Wenn der Timer auf idle wechselt -> sofort AUS und beenden
   - choose:
       - conditions: >-
           {{ trigger is defined
-            and trigger.platform == 'event'
-            and trigger.event.event_type in ['timer.finished','timer.cancelled'] }}
+            and trigger.platform == 'state'
+            and trigger.entity_id == v_timer
+            and trigger.to_state is defined
+            and trigger.to_state.state == 'idle' }}
         sequence:
           # Schaltet beide Strahler aus
           - action: light.turn_off
@@ -102,13 +100,12 @@ actions:
             data:
               option: 'AUS'
           # Beendet die Automation
-          - stop: "Timer finished -> AUS"
+          - stop: "Timer idle -> AUS"
 
   # --- Laufzeit-Variablen berechnen ---
   - variables:
       program: "{{ states(v_select) }}"
       duration: "{{ states(v_duration_entity) | int(20) }}"                # Gesamtprogrammdauer (min)
-      end_ts: "{{ now().timestamp() + (duration | int(20)) * 60 }}"
 
   # --- Timer steuern (für Restlaufzeit im Dashboard) ---
   - choose:
@@ -144,7 +141,18 @@ actions:
           - condition: template
             value_template: "{{ program == 'Gleichmässig' }}"
         sequence:
-          # Strahler mit maximaler Intensität einschalten
+          # Strahler einschalten (setzen initial selbst auf 50%)
+          - action: light.turn_on
+            target:
+              entity_id:
+                - !input strahler_liege
+                - !input strahler_oben
+            data:
+              transition: 1
+          # Kurz warten, bevor die Zielintensität gesetzt wird
+          - delay:
+              seconds: 1
+          # Strahler auf maximale Intensität setzen
           - action: light.turn_on
             target:
               entity_id:
@@ -154,8 +162,10 @@ actions:
               brightness_pct: "{{ states(v_max_entity) | int(100) }}"
               transition: 1
           # Gewählte Dauer warten
-          - delay:
-              minutes: "{{ duration }}"
+          - wait_for_trigger:
+              - trigger: state
+                entity_id: !input timer_entity
+                to: idle
           # Strahler ausschalten
           - action: light.turn_off
             target:
@@ -184,8 +194,12 @@ actions:
           # Solange Programm aktiv und Zeit nicht abgelaufen
           - repeat:
               while:
-                - condition: template >-
-                    {{ is_state(v_select,'Intervall') and now().timestamp() < end_ts }}
+                - condition: template
+                  value_template: >-
+                    {{ is_state(v_select,'Intervall')
+                       and is_state(v_timer, 'active')
+                       and state_attr(v_timer, 'finishes_at') is not none
+                       and now().timestamp() < (as_timestamp(state_attr(v_timer, 'finishes_at')) | int(0)) }}
               sequence:
                 # Laufende Werte und Schrittzeit berechnen
                 - variables:
@@ -256,9 +270,12 @@ actions:
           # Ein Durchlauf von min zu max und zurück
           - repeat:
               while:
-                - condition: template >-
+                - condition: template
+                  value_template: >-
                     {{ is_state(v_select,'Einmal AUF und AB')
-                       and now().timestamp() < end_ts
+                       and is_state(v_timer, 'active')
+                       and state_attr(v_timer, 'finishes_at') is not none
+                       and now().timestamp() < (as_timestamp(state_attr(v_timer, 'finishes_at')) | int(0))
                        and repeat.index <= ((states(v_max_entity)|int(100) - states(v_min_entity)|int(5)) // step_pct + 1) * 2 }}
               sequence:
                 # Laufende Werte und Schrittzeit berechnen
@@ -266,7 +283,9 @@ actions:
                     min_pct: "{{ states(v_min_entity) | int(5) }}"
                     max_pct: "{{ states(v_max_entity) | int(100) }}"
                     steps_total: "{{ ((max_pct - min_pct) // step_pct + 1) * 2 }}"
-                    sec_once: "{{ ((duration * 60 / steps_total) | round(0, 'ceil') | int) }}"
+                    remaining_steps: "{{ [steps_total - repeat.index + 1, 1] | max }}"
+                    remaining_sec: "{{ as_timedelta(state_attr(v_timer, 'remaining')).total_seconds() | int(0) }}"
+                    sec_once: "{{ [((remaining_sec / remaining_steps) | round(0, 'ceil') | int), 1] | max }}"
                     b: "{{ [[b, max_pct] | min, min_pct] | max }}"
                 # Strahler auf aktuelle Helligkeit setzen
                 - action: light.turn_on
